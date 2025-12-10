@@ -1,123 +1,125 @@
-import express from "express";
-import axios from "axios";
-import cors from "cors";
-import btoa from "btoa";
+// server.js
+const express = require("express");
+const axios = require("axios");
+const cors = require("cors");
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-/**
- * Track → Hostaway-style listings endpoint
- * Input: { domain, apiKey, apiSecret }
- */
+// -----------------------------
+// TRACK LISTINGS ENDPOINT
+// -----------------------------
 app.post("/track/listings", async (req, res) => {
   const { domain, apiKey, apiSecret } = req.body;
 
   if (!domain || !apiKey || !apiSecret) {
-    return res.status(400).json({ error: "Missing domain, apiKey, or apiSecret" });
+    return res.status(400).json({ error: "domain, apiKey, apiSecret are required" });
   }
 
-  const baseUrl = `https://${domain}.trackhs.com/api/pms/units`;
-  const authHeader = "Basic " + btoa(`${apiKey}:${apiSecret}`);
+  const authHeader = "Basic " + Buffer.from(`${apiKey}:${apiSecret}`).toString("base64");
+  const BASE_URL = `https://${domain}.trackhs.com/api/pms/units`;
+  const SIZE = 100;
 
-  let page = 1;
-  const pageSize = 100;
-  let activeUnits = [];
+  // Fetch one page of results
+  async function fetchPage(page) {
+    try {
+      const url = `${BASE_URL}?page=${page}&size=${SIZE}`;
+      console.log("Fetching:", url);
 
-  console.log("Track → Hostaway server running on port 3000");
-
-  try {
-    while (true) {
-      const url = `${baseUrl}?page=${page}&size=${pageSize}`;
-      console.log(`Fetching page ${page}: ${url}`);
-
-      let response;
-      try {
-        response = await axios.get(url, {
-          headers: {
-            Authorization: authHeader,
-            Accept: "application/json"
-          }
-        });
-      } catch (err) {
-        // Handle Track "Invalid page" signal (LAST PAGE)
-        if (err.response?.status === 409) {
-          console.log("Reached last page — stopping pagination.");
-          break;
-        }
-
-        console.error("Track fetch error:", err.response?.data || err);
-        return res.status(500).json({
-          error: "Failed to fetch Track listings",
-          details: err.response?.data || err.toString()
-        });
-      }
-
-      const units =
-        response.data?._embedded?.units ??
-        response.data?.units ??
-        [];
-
-      // No more units → stop pagination
-      if (units.length === 0) {
-        console.log("Empty page received — stopping pagination.");
-        break;
-      }
-
-      // Keep only active units
-      const onlyActive = units.filter(u => u.isActive === true);
-
-      // Transform to Hostaway-style JSON
-      const transformed = onlyActive.map(u => {
-        const wifiRaw = u.custom?.pms_units_wifi_details || "";
-        let wifiUsername = "";
-        let wifiPassword = "";
-
-        if (wifiRaw.includes("|")) {
-          const parts = wifiRaw.split("|");
-          wifiUsername = parts[0].trim();
-          wifiPassword = parts[1].trim();
-        }
-
-        const beds = Array.isArray(u.bedTypes)
-          ? u.bedTypes.reduce((sum, b) => sum + (b.count || 0), 0)
-          : null;
-
-        return {
-          id: u.id,
-          name: u.name || "",
-          street: u.streetAddress || "",
-          address: `${u.streetAddress || ""}, ${u.locality || ""}, ${u.region || ""} ${u.postal || ""}`,
-          city: u.locality || "",
-          state: u.region || "",
-          zipcode: u.postal || "",
-          bedrooms: u.bedrooms ?? null,
-          beds: beds,
-          bathrooms: u.fullBathrooms ?? null,
-          wifiUsername: wifiUsername,
-          wifiPassword: wifiPassword,
-          cleannessStatus: String(u.cleanStatusId ?? ""),
-          picture: u.coverImage || null
-        };
+      const response = await axios.get(url, {
+        headers: { Authorization: authHeader }
       });
 
-      activeUnits.push(...transformed);
+      return response.data;
+    } catch (err) {
+      if (err.response?.status === 409) {
+        // Track says "invalid page" → means you're done
+        return { _embedded: { units: [] } };
+      }
+      throw err;
+    }
+  }
+
+  // Fetch property's primary image
+  async function fetchPrimaryImage(unitId) {
+    try {
+      const url = `https://${domain}.trackhs.com/api/pms/units/${unitId}/assets`;
+
+      const response = await axios.get(url, {
+        headers: { Authorization: authHeader }
+      });
+
+      const assets = response.data._embedded?.assets || [];
+
+      const images = assets.filter(
+        a => a.type?.toLowerCase() === "image" || a.mimeType?.startsWith("image/")
+      );
+
+      if (images.length === 0) return null;
+
+      const primary = images.find(img => img.isPrimary) || images[0];
+      return primary.url || null;
+
+    } catch (err) {
+      console.log(`Image fetch failed for unit ${unitId}:`, err.message);
+      return null;
+    }
+  }
+
+  try {
+    let page = 1;
+    let allUnits = [];
+
+    // Pagination loop
+    while (true) {
+      const data = await fetchPage(page);
+      const units = data._embedded?.units || [];
+
+      if (units.length === 0) break;
+
+      allUnits.push(...units);
       page++;
     }
 
-    return res.json({
-      count: activeUnits.length,
-      listings: activeUnits
-    });
+    // Only active properties
+    const activeUnits = allUnits.filter(u => u.isActive);
+
+    // Build final minimized JSON with images
+    const results = await Promise.all(
+      activeUnits.map(async (u) => {
+        const imageUrl = await fetchPrimaryImage(u.id);
+
+        return {
+          id: u.id,
+          name: u.name,
+          shortName: u.shortName,
+          streetAddress: u.streetAddress,
+          city: u.locality,
+          region: u.region,
+          postal: u.postal,
+          unitCode: u.unitCode,
+          bedrooms: u.bedrooms,
+          bathrooms: u.fullBathrooms,
+          latitude: u.latitude,
+          longitude: u.longitude,
+          imageUrl: imageUrl || null
+        };
+      })
+    );
+
+    res.json({ count: results.length, listings: results });
 
   } catch (err) {
-    console.error("Unhandled Track fetch error:", err);
-    return res.status(500).json({
-      error: "Critical server error",
-      details: err.toString()
-    });
+    console.error("Track error:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(3000, () => console.log("Track → Hostaway server running on port 3000"));
+// -----------------------------
+// START SERVER
+// -----------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Track PMS API running on port ${PORT}`);
+});
