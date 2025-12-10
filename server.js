@@ -1,126 +1,126 @@
-// server.js (Track PMS → Clean Listings API with Cover Image)
-// ------------------------------------------------------------
-
-const express = require("express");
-const axios = require("axios");
-const cors = require("cors");
+import express from "express";
+import cors from "cors";
+import axios from "axios";
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(cors());
 
-// 🟢 HEALTH CHECK
-app.get("/", (req, res) => {
-  res.send("Track PMS API is running 🚀");
-});
+/**
+ * Fetch 1 image for a given unit (order = 0)
+ */
+async function fetchUnitImage(domain, authHeader, unitId) {
+  const url = `https://${domain}.trackhs.com/api/pms/units/${unitId}/images?page=1&size=1`;
 
-// 🟢 MAIN ENDPOINT
-app.post("/track/listings", async (req, res) => {
   try {
-    const { domain, apiKey, apiSecret } = req.body;
-
-    if (!domain || !apiKey || !apiSecret) {
-      return res.status(400).json({
-        error: "Missing required fields: domain, apiKey, apiSecret",
-      });
-    }
-
-    const baseUrl = `https://${domain}.trackhs.com/api/pms/units`;
-    const auth = {
-      headers: {
-        Authorization: "Basic " + Buffer.from(`${apiKey}:${apiSecret}`).toString("base64"),
-        Accept: "application/json"
-      },
-      timeout: 20000
-    };
-
-    // -----------------------------------------------------
-    // 🟦 PAGINATION — FETCH ALL ACTIVE UNITS
-    // -----------------------------------------------------
-    let page = 1;
-    const size = 100;
-    let allUnits = [];
-
-    while (true) {
-      const url = `${baseUrl}?page=${page}&size=${size}`;
-      console.log("Fetching page:", url);
-
-      const response = await axios.get(url, auth);
-      const embedded = response.data._embedded;
-
-      if (!embedded || !embedded.units || embedded.units.length === 0) break;
-
-      allUnits = allUnits.concat(embedded.units);
-      page++;
-
-      // 409 = page out of range
-      if (page > 200) break;
-    }
-
-    // Filter ACTIVE units
-    const activeUnits = allUnits.filter(u => u.isActive === true);
-
-    // -----------------------------------------------------
-    // 🟦 Fetch Cover Image for Each Unit (page=1 size=1)
-    // -----------------------------------------------------
-    async function getCoverImage(unitId) {
-      try {
-        const imgUrl = `https://${domain}.trackhs.com/api/pms/units/${unitId}/images?page=1&size=1`;
-        const imgResponse = await axios.get(imgUrl, auth);
-
-        const imgs = imgResponse.data._embedded?.images;
-        if (imgs && imgs.length > 0) {
-          return imgs[0].url; // Primary image
-        }
-      } catch (err) {
-        console.log("Image fetch failed for:", unitId);
-      }
-      return null;
-    }
-
-    // -----------------------------------------------------
-    // 🟦 Build Clean Listings JSON for Glide
-    // -----------------------------------------------------
-    const listings = [];
-
-    for (const unit of activeUnits) {
-      const coverImage = await getCoverImage(unit.id);
-
-      listings.push({
-        id: unit.id,
-        name: unit.name || null,
-        street: unit.street || null,
-        address: unit.address || null,
-        city: unit.city || null,
-        state: unit.state || null,
-        zipcode: unit.zip || null,
-        bedrooms: unit.bedrooms || null,
-        bathrooms: unit.bathrooms || null,
-        wifiUsername: unit.custom?.pms_units_network || null,
-        wifiPassword: unit.custom?.pms_units_network_password || null,
-        cleannessStatus: unit.cleanStatusId || null,
-        picture: coverImage
-      });
-    }
-
-    return res.json({
-      count: listings.length,
-      listings
+    const response = await axios.get(url, {
+      headers: { Authorization: authHeader, Accept: "application/json" },
     });
 
-  } catch (err) {
-    console.error("Server error:", err.response?.data || err.message);
-    return res.status(500).json({
-      error: "Failed fetching Track units",
-      detail: err.response?.data || err.message
+    const images = response.data?._embedded?.images || [];
+    if (images.length === 0) return null;
+
+    return images[0].url; // returns the S3 image URL
+  } catch (error) {
+    console.log(`Image fetch failed for unit ${unitId}:`, error.response?.data || error.message);
+    return null;
+  }
+}
+
+/**
+ * Main Track → PoolPilot compressed listing response
+ */
+app.post("/track/listings", async (req, res) => {
+  const { domain, apiKey, apiSecret } = req.body;
+
+  if (!domain || !apiKey || !apiSecret) {
+    return res.status(400).json({
+      error: "Missing domain, apiKey, or apiSecret",
     });
   }
+
+  const authHeader = "Basic " + Buffer.from(`${apiKey}:${apiSecret}`).toString("base64");
+
+  const pageSize = 100;
+  let page = 1;
+  let units = [];
+
+  console.log("Starting Track unit fetch…");
+
+  // Fetch ALL pages
+  while (true) {
+    const url = `https://${domain}.trackhs.com/api/pms/units?page=${page}&size=${pageSize}`;
+    console.log(`Fetching page ${page}: ${url}`);
+
+    try {
+      const response = await axios.get(url, {
+        headers: { Authorization: authHeader, Accept: "application/json" },
+      });
+
+      const pageUnits = response.data?._embedded?.units || [];
+      if (pageUnits.length === 0) break;
+
+      units = units.concat(pageUnits);
+      page++;
+    } catch (error) {
+      console.log("Track fetch error:", error.response?.data || error.message);
+      break;
+    }
+  }
+
+  console.log(`Total units fetched: ${units.length}`);
+
+  // Filter: only active units
+  units = units.filter((u) => u.isActive === true);
+
+  console.log(`Active units: ${units.length}`);
+
+  // Build compressed response
+  const listings = [];
+
+  for (const unit of units) {
+    const {
+      id,
+      name,
+      streetAddress,
+      locality,
+      region,
+      postal,
+      bedrooms,
+      fullBathrooms,
+      custom,
+    } = unit;
+
+    // Extract helpful custom fields
+    const wifiUsername = custom?.pms_units_network || custom?.pms_units_wifi_details || null;
+    const wifiPassword = custom?.pms_units_network_password || null;
+
+    // FETCH COVER IMAGE (option A)
+    const picture = await fetchUnitImage(domain, authHeader, id);
+
+    listings.push({
+      id,
+      name,
+      street: streetAddress,
+      address: `${streetAddress}, ${locality}, ${region} ${postal}`,
+      city: locality,
+      state: region,
+      zipcode: postal,
+      bedrooms,
+      bathrooms: fullBathrooms,
+      wifiUsername,
+      wifiPassword,
+      cleannessStatus: String(unit.cleanStatusId || ""),
+      picture, // new!
+    });
+  }
+
+  return res.json({ total: listings.length, listings });
 });
 
-// -----------------------------------------------------
-// 🟢 START SERVER
-// -----------------------------------------------------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Track PMS API running on port ${PORT}`);
+app.get("/", (req, res) => {
+  res.send("Track PMS Listing API is running.");
 });
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Track PMS API running on port ${port}`));
